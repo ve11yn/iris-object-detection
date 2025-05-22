@@ -1,9 +1,11 @@
 import 'dart:io';
 import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import 'package:flutter/services.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:tflite_flutter_helper/tflite_flutter_helper.dart';
+import 'package:image/image.dart' as img;
 
 class ObjectDetection extends StatefulWidget {
   final List<CameraDescription> cameras;
@@ -17,29 +19,39 @@ class _ObjectDetectionState extends State<ObjectDetection> {
   late CameraController _cameraController;
   bool isCameraReady = false;
   String result = "Detecting...";
-  late ObjectDetector _objectDetector;
   bool isDetecting = false;
   File? _imageFile;
   List<DetectedObject> _detectedObjects = [];
   Size? _imageSize;
 
+  // tflite
+  late Interpreter _interpreter;
+  late List<String> _labels;
+
+  Future<void> loadModel() async {
+    final interpreterOptions = InterpreterOptions();
+    _interpreter = await Interpreter.fromAsset('assets/model/object-detection.tflite', options: interpreterOptions);
+    final labelData = await rootBundle.loadString('assets/model/label.txt');
+    _labels = labelData.split('\n');
+  }
+
   @override
   void initState() {
     super.initState();
-    _initializeObjectDetector();
     _initializeCamera();
+    loadModel();
   }
 
   Future<void> _initializeCamera() async {
     try {
       _cameraController = CameraController(
-        widget.cameras[0], 
-        ResolutionPreset.medium, 
+        widget.cameras[0],
+        ResolutionPreset.medium,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg
+        imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await _cameraController.initialize();
-      
+
       if (!mounted) return;
       setState(() {
         isCameraReady = true;
@@ -53,108 +65,80 @@ class _ObjectDetectionState extends State<ObjectDetection> {
     }
   }
 
-  Future<void> _initializeObjectDetector() async {
-    try {
-      // Use default detector options
-      final options = ObjectDetectorOptions(
-        mode: DetectionMode.single, // Use single image mode
-        classifyObjects: true, // Classify objects (get labels)
-        multipleObjects: true, // Detect multiple objects
-      );
-      _objectDetector = ObjectDetector(options: options);
-      setState(() {
-        result = "Object detector initialized";
-      });
-    } catch (e) {
-      setState(() {
-        result = "ML initialization error: $e";
-      });
-      print("ML initialization error: $e");
-    }
-  }
-
   Future<void> _detectObjects() async {
     if (isDetecting) return;
-    
+
     setState(() {
       isDetecting = true;
       result = "Processing...";
       _detectedObjects = [];
     });
-    
+
     try {
-      // Take a picture
       final XFile? picture = await _cameraController.takePicture();
-      if (picture == null) {
-        setState(() {
-          result = "Failed to take picture";
-          isDetecting = false;
-        });
-        return;
-      }
-      
-      // Create a file from the picture
+      if (picture == null) return;
       _imageFile = File(picture.path);
-      if (!await _imageFile!.exists()) {
-        setState(() {
-          result = "Error: Image file does not exist";
-          isDetecting = false;
-        });
-        return;
-      }
-      
-      // Get the image dimensions for proper scaling of bounding boxes
-      final image = await decodeImageFromList(_imageFile!.readAsBytesSync());
+      final image = img.decodeImage(await _imageFile!.readAsBytes())!;
       _imageSize = Size(image.width.toDouble(), image.height.toDouble());
 
-      // Process with ML Kit Object Detector
-      final inputImage = InputImage.fromFilePath(picture.path);
-      final objects = await _objectDetector.processImage(inputImage);
-      
-      // Format results
-      String detectedObjectsText = "";
-      if (objects.isNotEmpty) {
-        _detectedObjects = objects;
-        detectedObjectsText = objects.map((object) {
-          String text = "";
-          if (object.labels.isNotEmpty) {
-            final label = object.labels.first;
-            text = "${label.text} - ${(label.confidence * 100).toStringAsFixed(2)}%";
-          } else {
-            text = "Unknown object";
-          }
-          return text;
-        }).join("\n");
-      } else {
-        detectedObjectsText = "No objects detected";
+      final inputImage = ImageProcessorBuilder()
+          .add(ResizeOp(300, 300, ResizeMethod.BILINEAR))
+          .add(NormalizeOp(127.5, 127.5))
+          .build()
+          .process(TensorImage.fromImage(image));
+
+      final outputLocations = List.filled(1 * 10 * 4, 0.0).reshape([1, 10, 4]);
+      final outputClasses = List.filled(1 * 10, 0.0).reshape([1, 10]);
+      final outputScores = List.filled(1 * 10, 0.0).reshape([1, 10]);
+      final numDetections = List.filled(1, 0.0).reshape([1]);
+
+      _interpreter.runForMultipleInputs([inputImage.buffer], {
+        0: outputLocations,
+        1: outputClasses,
+        2: outputScores,
+        3: numDetections
+      });
+
+      List<DetectedObject> objects = [];
+      int count = numDetections[0][0].toInt();
+      for (int i = 0; i < count; i++) {
+        final score = outputScores[0][i];
+        if (score > 0.5) {
+          final label = _labels[outputClasses[0][i].toInt()];
+          final box = outputLocations[0][i];
+          final rect = Rect.fromLTRB(
+            box[1] * _imageSize!.width,
+            box[0] * _imageSize!.height,
+            box[3] * _imageSize!.width,
+            box[2] * _imageSize!.height,
+          );
+
+          objects.add(DetectedObject(
+            boundingBox: rect,
+            labels: [Label(text: label, confidence: score)],
+          ));
+        }
       }
-        
+
       setState(() {
-        result = detectedObjectsText;
+        _detectedObjects = objects;
+        result = objects.isEmpty
+            ? "No objects detected"
+            : objects
+                .map((e) => "${e.labels.first.text} - ${(e.labels.first.confidence * 100).toStringAsFixed(2)}%")
+                .join("\n");
       });
-    } catch (error) {
-      print("Error processing image: $error");
-      setState(() {
-        result = "Error: $error";
-        _detectedObjects = [];
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text("Error processing image: $error"), 
-          backgroundColor: Colors.red,
-        )
-      );
+    } catch (e) {
+      setState(() => result = "Error: $e");
     } finally {
-      setState(() {
-        isDetecting = false;
-      });
+      setState(() => isDetecting = false);
     }
   }
 
   @override
   void dispose() {
     _cameraController.dispose();
-    _objectDetector.close();
+    _interpreter.close();
     super.dispose();
   }
 
@@ -169,67 +153,39 @@ class _ObjectDetectionState extends State<ObjectDetection> {
               onTap: isCameraReady ? _detectObjects : null,
               child: Stack(
                 children: [
-                  // Show either camera preview or the captured image with bounding boxes
                   if (_imageFile != null && _detectedObjects.isNotEmpty)
-                    Container(
-                      width: double.infinity,
-                      height: double.infinity,
-                      child: FittedBox(
-                        fit: BoxFit.contain,
-                        child: Stack(
-                          children: [
-                            Image.file(_imageFile!),
-                            if (_imageSize != null)
-                              CustomPaint(
-                                painter: ObjectDetectorPainter(
-                                  _detectedObjects, 
-                                  _imageSize!,
-                                  MediaQuery.of(context).size
-                                ),
+                    FittedBox(
+                      fit: BoxFit.contain,
+                      child: Stack(
+                        children: [
+                          Image.file(_imageFile!),
+                          if (_imageSize != null)
+                            CustomPaint(
+                              painter: ObjectDetectorPainter(
+                                _detectedObjects,
+                                _imageSize!,
+                                MediaQuery.of(context).size,
                               ),
-                          ],
-                        ),
+                            ),
+                        ],
                       ),
                     )
                   else
-                    Container(
-                      width: MediaQuery.of(context).size.width,
-                      child: isCameraReady 
-                        ? CameraPreview(_cameraController) 
-                        : Center(child: CircularProgressIndicator()),
+                    Center(
+                      child: isCameraReady
+                          ? CameraPreview(_cameraController)
+                          : CircularProgressIndicator(),
                     ),
-                    
-                  if (isCameraReady && _imageFile == null)
-                    Positioned(
-                      top: 20,
-                      left: 0,
-                      right: 0,
-                      child: Center(
-                        child: Text(
-                          "Tap on screen to detect objects",
-                          style: TextStyle(
-                            color: Colors.white,
-                            backgroundColor: Colors.black54,
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ),
-                    
                   if (_imageFile != null)
                     Positioned(
                       bottom: 20,
                       right: 20,
                       child: FloatingActionButton(
-                        onPressed: () {
-                          setState(() {
-                            _imageFile = null;
-                            _detectedObjects = [];
-                          });
-                        },
+                        onPressed: () => setState(() {
+                          _imageFile = null;
+                          _detectedObjects = [];
+                        }),
                         child: Icon(Icons.refresh),
-                        tooltip: "Return to camera",
                       ),
                     ),
                 ],
@@ -237,38 +193,10 @@ class _ObjectDetectionState extends State<ObjectDetection> {
             ),
           ),
           Container(
-            width: MediaQuery.of(context).size.width,
-            decoration: BoxDecoration(
-              color: Colors.blue,
-              borderRadius: const BorderRadius.only(
-                topRight: Radius.circular(20),
-                topLeft: Radius.circular(20),
-              ),
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const SizedBox(height: 12),
-                const Text(
-                  "Detected Objects",
-                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 12),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(10),
-                    boxShadow: const [
-                      BoxShadow(color: Colors.black26, blurRadius: 4)
-                    ],
-                  ),
-                  child: Text(result, textAlign: TextAlign.start),
-                ),
-                SizedBox(height: 12),
-              ],
-            ),
+            width: double.infinity,
+            padding: EdgeInsets.all(16),
+            color: Colors.grey[200],
+            child: Text(result),
           ),
         ],
       ),
@@ -276,86 +204,68 @@ class _ObjectDetectionState extends State<ObjectDetection> {
   }
 }
 
-// Custom painter to draw bounding boxes
+class DetectedObject {
+  final Rect boundingBox;
+  final List<Label> labels;
+  DetectedObject({required this.boundingBox, required this.labels});
+}
+
+class Label {
+  final String text;
+  final double confidence;
+  Label({required this.text, required this.confidence});
+}
+
 class ObjectDetectorPainter extends CustomPainter {
   final List<DetectedObject> objects;
   final Size originalImageSize;
   final Size currentCanvasSize;
-  
+
   ObjectDetectorPainter(this.objects, this.originalImageSize, this.currentCanvasSize);
-  
+
   @override
   void paint(Canvas canvas, Size size) {
-    // Calculate the scaling factor between original image and displayed size
-    final double scaleX = currentCanvasSize.width / originalImageSize.width;
-    final double scaleY = currentCanvasSize.height / originalImageSize.height;
-    final double scale = math.min(scaleX, scaleY);
-    
-    // Paint for the bounding box
-    final Paint paint = Paint()
+    final scaleX = currentCanvasSize.width / originalImageSize.width;
+    final scaleY = currentCanvasSize.height / originalImageSize.height;
+    final scale = math.min(scaleX, scaleY);
+
+    final Paint boxPaint = Paint()
       ..color = Colors.yellow
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.0;
-      
-    // Paint for the label background
-    final Paint backgroundPaint = Paint()
+      ..strokeWidth = 2;
+
+    final Paint bgPaint = Paint()
       ..color = Colors.yellow.withOpacity(0.6)
       ..style = PaintingStyle.fill;
-    
-    for (final DetectedObject object in objects) {
-      // Scale the bounding box to the current display size
-      final Rect scaledRect = Rect.fromLTRB(
-        object.boundingBox.left * scale,
-        object.boundingBox.top * scale,
-        object.boundingBox.right * scale,
-        object.boundingBox.bottom * scale,
+
+    for (final obj in objects) {
+      final rect = Rect.fromLTRB(
+        obj.boundingBox.left * scale,
+        obj.boundingBox.top * scale,
+        obj.boundingBox.right * scale,
+        obj.boundingBox.bottom * scale,
       );
-      
-      // Draw the bounding box
-      canvas.drawRect(scaledRect, paint);
-      
-      // Draw label if available
-      if (object.labels.isNotEmpty) {
-        final label = object.labels.first;
-        final text = "${label.text} ${(label.confidence * 100).toStringAsFixed(0)}%";
-        
-        final textSpan = TextSpan(
-          text: text,
-          style: TextStyle(
-            color: Colors.black,
-            fontSize: 16,
-            fontWeight: FontWeight.bold,
-          ),
-        );
-        
-        final textPainter = TextPainter(
-          text: textSpan,
-          textDirection: TextDirection.ltr,
-        );
-        
-        textPainter.layout();
-        
-        // Draw background for text
-        final textBackgroundRect = Rect.fromLTWH(
-          scaledRect.left,
-          scaledRect.top - textPainter.height - 4,
-          textPainter.width + 8,
-          textPainter.height + 4,
-        );
-        
-        canvas.drawRect(textBackgroundRect, backgroundPaint);
-        
-        // Draw text
-        textPainter.paint(
-          canvas, 
-          Offset(scaledRect.left + 4, scaledRect.top - textPainter.height - 2),
-        );
-      }
+      canvas.drawRect(rect, boxPaint);
+
+      final label = obj.labels.first;
+      final textSpan = TextSpan(
+        text: "${label.text} ${(label.confidence * 100).toStringAsFixed(1)}%",
+        style: TextStyle(color: Colors.black, fontSize: 14),
+      );
+      final tp = TextPainter(text: textSpan, textDirection: TextDirection.ltr);
+      tp.layout();
+
+      final bgRect = Rect.fromLTWH(
+        rect.left,
+        rect.top - tp.height - 4,
+        tp.width + 8,
+        tp.height + 4,
+      );
+      canvas.drawRect(bgRect, bgPaint);
+      tp.paint(canvas, Offset(rect.left + 4, rect.top - tp.height - 2));
     }
   }
-  
+
   @override
-  bool shouldRepaint(ObjectDetectorPainter oldDelegate) {
-    return oldDelegate.objects != objects;
-  }
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
