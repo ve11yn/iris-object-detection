@@ -1,16 +1,22 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+// import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:iris/object-detection.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final cameras = await availableCameras();
-  await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.portraitUp,
-    DeviceOrientation.portraitDown,
-  ]);
-  runApp(MyApp(cameras: cameras));
+  
+  try {
+    final cameras = await availableCameras();
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+    runApp(MyApp(cameras: cameras));
+  } catch (e) {
+    runApp(MyApp(cameras: []));
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -21,11 +27,11 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Iris',
+      title: 'Iris Object Detection',
       theme: ThemeData(
-        primaryColor: Color(0xFFC9DCFF),
+        primaryColor: const Color(0xFFC9DCFF),
         colorScheme: ColorScheme.fromSwatch(
-          primarySwatch: MaterialColor(
+          primarySwatch: const MaterialColor(
             0xFFC9DCFF,
             <int, Color>{
               50: Color(0xFFEFF6FB),
@@ -42,7 +48,26 @@ class MyApp extends StatelessWidget {
           ),
         ),
       ),
-      home: ObjectDetection(cameras: cameras),
+      home: cameras.isEmpty 
+        ? const CameraErrorScreen()
+        : ObjectDetection(cameras: cameras),
+    );
+  }
+}
+
+class CameraErrorScreen extends StatelessWidget {
+  const CameraErrorScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Camera Error')),
+      body: const Center(
+        child: Text(
+          'No cameras available on this device',
+          style: TextStyle(fontSize: 18),
+        ),
+      ),
     );
   }
 }
